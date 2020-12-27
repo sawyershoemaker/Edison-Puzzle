@@ -1,8 +1,10 @@
 import copy
 
+import visualizer
+import time
+
 
 class Board:
-
     SIZE = 56
 
     def __init__(self):
@@ -61,14 +63,16 @@ class Board:
         return copied_board
 
 
+
 def get_solution(board, remaining, positions):
+    visualizer.visualize(positions)
+
     if board.space == 0:
         return positions
 
     for piece in remaining:
         for isRotated in (False, True):
             rotated_piece = piece if not isRotated else (piece[1], piece[0])
-            # TODO: handle rotation
             if board.does_fit(rotated_piece):
                 # insert piece into board, remove piece from remaining, append position
                 new_board = board.copy()
@@ -88,7 +92,10 @@ def get_solution(board, remaining, positions):
 
 
 ''' ======================= Run the Code ======================= '''
+visualizer = visualizer.Visualizer()
 
 all_pieces = [(28, 14), (21, 18), (21, 18), (21, 14), (21, 14), (32, 11), (32, 10), (28, 7), (28, 6), (17, 14), (14, 4), (10, 7)]
 board = Board()
 print(get_solution(board, all_pieces, []))
+
+time.sleep(25)
