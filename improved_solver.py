@@ -1,149 +1,188 @@
-import copy
 import time
-import sys
-import numpy as np
-from functools import lru_cache
+from collections import Counter
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
 
-# define board and pieces
 BOARD_SIZE = 56
-ALL_PIECES = [(28, 14), (21, 18), (21, 18), (21, 14), (21, 14), (32, 11), (32, 10), (28, 7), (28, 6), (17, 14), (14, 4), (10, 7)]
+FULL_ROW_MASK = (1 << BOARD_SIZE) - 1
+USE_TRANSPOSITION = False
 
-# precomp piece areas
-PIECE_AREAS = {piece: piece[0] * piece[1] for piece in ALL_PIECES}
+ALL_PIECES: Sequence[Tuple[int, int]] = (
+    (28, 14),
+    (21, 18),
+    (21, 18),
+    (21, 14),
+    (21, 14),
+    (32, 11),
+    (32, 10),
+    (28, 7),
+    (28, 6),
+    (17, 14),
+    (14, 4),
+    (10, 7),
+)
 
-@lru_cache(maxsize=1024)
-def get_rotations(piece):
-    w, h = piece
-    if w == h:
-        return (piece,)
-    return (piece, (h, w))
 
-class Board:
-    def __init__(self):
-        self.grid = np.ones((BOARD_SIZE, BOARD_SIZE), dtype=bool)
-        self.next_free = (0, 0)
-        self.space = BOARD_SIZE * BOARD_SIZE
-        self._next_free_cache = None
-        self._hash = None
-        self._free_positions = None
+@dataclass(frozen=True)
+class Rotation:
+    width: int
+    height: int
+    area: int
+    row_mask: int
 
-    def __hash__(self):
-        if self._hash is None:
-            self._hash = hash((self.grid.tobytes(), self.next_free))
-        return self._hash
 
-    def __eq__(self, other):
-        if not isinstance(other, Board):
+@dataclass(frozen=True)
+class Piece:
+    dims: Tuple[int, int]
+    area: int
+    rotations: Tuple[Rotation, ...]
+
+
+def build_piece_library() -> Tuple[List[Piece], List[int]]:
+    counter = Counter(ALL_PIECES)
+
+    def rotation_variants(dim: Tuple[int, int]) -> Tuple[Rotation, ...]:
+        w, h = dim
+        area = w * h
+        row_mask = (1 << w) - 1
+        if w == h:
+            return (Rotation(w, h, area, row_mask),)
+        return (
+            Rotation(w, h, area, row_mask),
+            Rotation(h, w, area, (1 << h) - 1),
+        )
+
+    pieces = []
+    counts = []
+    # sort by area desc, then by max dimension to place awkward rectangles earlier
+    for dims, count in sorted(
+        counter.items(),
+        key=lambda item: (item[0][0] * item[0][1], max(item[0]), min(item[0])),
+        reverse=True,
+    ):
+        pieces.append(
+            Piece(
+                dims=dims,
+                area=dims[0] * dims[1],
+                rotations=rotation_variants(dims),
+            )
+        )
+        counts.append(count)
+    return pieces, counts
+
+
+PIECES, INITIAL_COUNTS = build_piece_library()
+TOTAL_PIECE_AREA = sum(piece.area * count for piece, count in zip(PIECES, INITIAL_COUNTS))
+
+
+def find_first_free(rows: Sequence[int]) -> Optional[Tuple[int, int]]:
+    for y, row in enumerate(rows):
+        if row:
+            lowest_bit = row & -row
+            x = lowest_bit.bit_length() - 1
+            return y, x
+    return None
+
+
+def solve_fast() -> Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]]:
+    size = BOARD_SIZE
+    full_mask = FULL_ROW_MASK
+    board_rows: List[int] = [full_mask for _ in range(size)]
+    remaining_counts: List[int] = INITIAL_COUNTS.copy()
+    placements: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+    transposition: Optional[dict[Tuple[Tuple[int, ...], Tuple[int, ...]], bool]] = (
+        {} if USE_TRANSPOSITION else None
+    )
+
+    def search(remaining_area: int) -> bool:
+        if remaining_area == 0:
+            return True
+
+        first_free = find_first_free(board_rows)
+        if first_free is None:
             return False
-        return (self.grid == other.grid).all() and self.next_free == other.next_free
+        anchor_y, anchor_x = first_free
 
-    def does_fit(self, piece):
-        if self.next_free[0] + piece[0] > BOARD_SIZE or self.next_free[1] + piece[1] > BOARD_SIZE:
-            return False
-        return np.all(self.grid[self.next_free[1]:self.next_free[1] + piece[1], 
-                               self.next_free[0]:self.next_free[0] + piece[0]])
+        state_key: Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]] = None
 
-    def find_next_free(self):
-        """Find the next free position more efficiently"""
-        if self._free_positions is None:
-            # use numpy's optimized operations to find the first True value
-            free_positions = np.where(self.grid)
-            if len(free_positions[0]) > 0:
-                self._free_positions = (int(free_positions[1][0]), int(free_positions[0][0]))
-            else:
-                self._free_positions = (BOARD_SIZE, BOARD_SIZE)
-        return self._free_positions
+        if transposition:
+            state_key = (tuple(board_rows), tuple(remaining_counts))
+            cached = transposition.get(state_key)
+            if cached is False:
+                return False
 
-    def insert(self, piece):
-        position = self.next_free
-        self.grid[self.next_free[1]:self.next_free[1] + piece[1], 
-                 self.next_free[0]:self.next_free[0] + piece[0]] = False
-        
-        if self._next_free_cache is None:
-            self.next_free = self.find_next_free()
-        else:
-            self.next_free = self._next_free_cache
-            self._next_free_cache = None
+        for idx, count in enumerate(remaining_counts):
+            if count == 0:
+                continue
+            piece = PIECES[idx]
 
-        self.space -= piece[0] * piece[1]
-        self._hash = None  # invalidate hash cache
-        self._free_positions = None  # invalidate free positions cache
-        return position
+            for rotation in piece.rotations:
+                w, h = rotation.width, rotation.height
+                end_x = anchor_x + w
+                end_y = anchor_y + h
+                if end_x > size or end_y > size:
+                    continue
 
-    def copy(self):
-        copied_board = Board()
-        copied_board.grid = self.grid.copy()
-        copied_board.next_free = self.next_free
-        copied_board.space = self.space
-        return copied_board
+                mask = rotation.row_mask << anchor_x
+                fits = True
+                for row in range(anchor_y, end_y):
+                    if board_rows[row] & mask != mask:
+                        fits = False
+                        break
 
-def solve_puzzle():
-    # sort pieces by area
-    piece_sizes = [(i, PIECE_AREAS[piece]) for i, piece in enumerate(ALL_PIECES)]
-    piece_sizes.sort(key=lambda x: x[1], reverse=True)
-    sorted_pieces = [ALL_PIECES[idx] for idx, _ in piece_sizes]
-    
-    # precomp all rotations
-    piece_rotations = {piece: get_rotations(piece) for piece in sorted_pieces}
-    
-    # transpos table to avoid revisited states
-    transposition_table = {}
-    
-    def solve(board, remaining, positions, remaining_area):
-        # check transpos table
-        board_hash = hash(board)
-        if board_hash in transposition_table:
-            return transposition_table[board_hash]
+                if not fits:
+                    continue
 
-        if board.space == 0:
-            return positions
+                clear_mask = full_mask ^ mask
+                for row in range(anchor_y, end_y):
+                    board_rows[row] &= clear_mask
 
-        # early pruning: if remaining pieces can't fill the space
-        if remaining_area < board.space:
-            return None
+                placements.append(((rotation.width, rotation.height), (anchor_x, anchor_y)))
+                remaining_counts[idx] -= 1
 
-        # try each piece
-        for piece in remaining:
-            # try each rotation
-            for rot in piece_rotations[piece]:
-                if board.does_fit(rot):
-                    new_board = board.copy()
-                    new_remaining = remaining.copy()
-                    
-                    # place the piece
-                    position = new_board.insert(rot)
-                    new_remaining.remove(piece)
-                    positions.append((rot, position))
-                    
-                    # try to solve the rest
-                    solution = solve(new_board, new_remaining, positions, remaining_area - PIECE_AREAS[piece])
-                    if solution:
-                        transposition_table[board_hash] = solution
-                        return solution
-                    
-                    # backtrack
-                    positions.pop()
-        
-        transposition_table[board_hash] = None
-        return None
+                if search(remaining_area - rotation.area):
+                    return True
 
-    # calc total area of remaining pieces
-    total_area = sum(PIECE_AREAS[piece] for piece in sorted_pieces)
-    
-    # solve
-    board = Board()
-    return solve(board, sorted_pieces, [], total_area)
+                remaining_counts[idx] += 1
+                placements.pop()
+                for row in range(anchor_y, end_y):
+                    board_rows[row] |= mask
+
+        if transposition is not None:
+            if state_key is None:
+                state_key = (tuple(board_rows), tuple(remaining_counts))
+            transposition[state_key] = False
+
+            if len(transposition) > 500_000:
+                transposition.clear()
+
+        return False
+
+    success = search(TOTAL_PIECE_AREA)
+    if success:
+        return placements.copy()
+    return None
+
+
+def benchmark(iterations: int = 5) -> float:
+    start = time.perf_counter()
+    for _ in range(iterations):
+        solve_fast()
+    end = time.perf_counter()
+    return (end - start) / iterations
+
 
 if __name__ == "__main__":
-    print("Starting improved_solver...")
-    start_time = time.perf_counter()
-    solution = solve_puzzle()
-    end_time = time.perf_counter()
-    
+    print("Running solver_fast...")
+    t0 = time.perf_counter()
+    solution = solve_fast()
+    t1 = time.perf_counter()
+    elapsed_ms = (t1 - t0) * 1000.0
+
     if solution:
-        elapsed_time = end_time - start_time
-        print(f"\nSolution found in {elapsed_time*1000} ms!\n")
-        for rot, pos in solution:
-            print(f"Piece {rot} at {pos}")
+        print(f"Solution found in {elapsed_ms:.5f} ms")
+        for dims, pos in solution:
+            print(f"Piece {dims} at {pos}")
     else:
-        print("No solution found") 
+        print("No solution found.")
+
